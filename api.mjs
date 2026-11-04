@@ -33,7 +33,6 @@ async function readState() {
 }
 
 async function writeState(state, etag) {
-  // บังคับให้เขียนลงฐานข้อมูลเสมอเพื่อลดปัญหา Concurrency ล่มเวลาสมัครสมาชิกใหม่
   try {
     const opts = etag ? { onlyIfMatch: etag } : {};
     const res = await forum().setJSON("state", state, opts);
@@ -230,7 +229,7 @@ export default async (req) => {
   try {
     const { state, etag } = await readState();
 
-    // 1. REGISTER / SIGN UP (สมัครสมาชิกใหม่)
+    // 1. REGISTER / SIGN UP
     if (req.method === "POST" && path === "/api/register") {
       const { username, password, first, last, gender, year, birth, company, platoon } = await req.json();
       
@@ -239,4 +238,77 @@ export default async (req) => {
         return err(400, "USER_EXISTS", "ชื่อผู้ใช้นี้ถูกใช้ไปแล้ว");
       }
 
-      // ตรรกะใหม่: ใครสมัครคนแรกสุด (ความยาวอาร์เรย์เป็น 0) ได้เป็น admin ทันที
+      const isFirstUser = state.users.length === 0;
+      const myRole = isFirstUser ? "admin" : "user";
+      const uId = uid();
+      const pwdData = hashPw(password);
+
+const newUser = {
+id: uId,
+username,
+first,
+last,
+gender: gender || "",
+year: year || "",
+birth: birth || "",
+company: company || "",
+platoon: platoon || "",
+role: myRole,
+banned: false,
+suspendedUntil: 0,
+postBlockUntil: 0,
+reportCount: 0,
+tags: isFirstUser ? ["แอดมินระบบ"] : []
+};
+state.users.push(newUser);
+// บันทึกรหัสผ่านลงคลัง creds2
+await creds().setJSON("p/" + uId, pwdData);
+// บันทึกสถานะหลักกลับไป
+const newEtag = await writeState(state, etag);
+if (!newEtag) return err(409, "CONFLICT", "ระบบไม่สามารถลงทะเบียนได้ในขณะนี้ กรุณาลองใหม่อีกครั้ง");
+const token = await newSession(uId);
+return json({ token, user: newUser });
+}
+// 2. LOGIN
+if (req.method === "POST" && path === "/api/login") {
+const { username, password } = await req.json();
+const u = state.users.find(x => x.username.toLowerCase() === username.toLowerCase());
+if (!u) return err(401, "AUTH_FAILED", "ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง");
+const rec = await creds().get("p/" + u.id, { type: "json" });
+if (!rec || !checkPw(password, rec)) return err(401, "AUTH_FAILED", "ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง");
+if (u.banned) return err(403, "BANNED", "บัญชีของคุณถูกระงับการใช้งานอย่างถาวร");
+const token = await newSession(u.id);
+return json({ token, user: u });
+}
+// 3. GET STATE
+if (req.method === "GET" && path === "/api/state") {
+const auth = await authUser(req, state);
+if (!auth) return err(401, "UNAUTHORIZED", "กรุณาเข้าสู่ระบบ");
+if (maintActive(state) && auth.user.role !== "admin") {
+return json({ site: state.site, users: state.users.map(x => ({ id: x.id, username: x.username, role: x.role })) });
+}
+return json({ state, me: auth.user });
+}
+// 4. MUTATE / UPDATE STATE
+if (req.method === "POST" && path === "/api/mutate") {
+const auth = await authUser(req, state);
+if (!auth) return err(401, "UNAUTHORIZED", "กรุณาเข้าสู่ระบบ");
+if (auth.user.banned || auth.user.suspendedUntil > Date.now()) return err(403, "FORBIDDEN", "คุณถูกระงับการใช้งานชั่วคราว");
+if (maintActive(state) && auth.user.role !== "admin") return err(503, "MAINTENANCE", "ระบบกำลังปิดปรับปรุง");
+let { ops } = await req.json();
+if (!Array.isArray(ops)) return err(400, "BAD_REQUEST", "รูปแบบคำสั่งไม่ถูกต้อง");
+ops = await externalizeMedia(ops);
+for (const op of ops) {
+if (!allowed(op, auth.user, state)) return err(403, "UNAUTHORIZED_OP", "คุณไม่มีสิทธิ์ทำรายการนี้");
+const ok = applyOp(state, op);
+if (!ok) return err(400, "BAD_OP", "คำสั่งทำงานไม่สำเร็จ");
+}
+const newEtag = await writeState(state, etag);
+if (!newEtag) return err(409, "CONFLICT", "ข้อมูลมีการเปลี่ยนแปลงจากที่อื่น กรุณาดึงข้อมูลใหม่");
+return json({ state, etag: newEtag });
+}
+return err(404, "NOT_FOUND", "ไม่พบหน้า API ที่เรียก");
+} catch (e) {
+return err(500, "SERVER_ERROR", e.message || "เกิดข้อผิดพลาดภายในระบบหลังบ้าน");
+}
+};
